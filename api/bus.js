@@ -1,5 +1,4 @@
 export default async function handler(req, res) {
-  // 設定 CORS 與 Cache
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Cache-Control', 's-maxage=5, stale-while-revalidate=5');
@@ -13,7 +12,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing target URL' });
   }
 
-  // 安全白名單限制
   const allowedHosts = ['data.etabus.gov.hk', 'data.etagmb.gov.hk'];
   try {
     const target = new URL(url);
@@ -21,7 +19,6 @@ export default async function handler(req, res) {
       return res.status(403).json({ error: 'Domain not allowed' });
     }
 
-    // 設定 4 秒連線 Timeout 斷路器
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 4000);
 
@@ -34,7 +31,7 @@ export default async function handler(req, res) {
     clearTimeout(timeout);
 
     if (!response.ok) {
-      return res.status(response.status).json({ error: `Upstream status ${response.status}` });
+      return res.status(response.status).json({ error: `Upstream error ${response.status}` });
     }
 
     const data = await response.json();
