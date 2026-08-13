@@ -127,7 +127,6 @@
     let autoRefreshTimer = null;
     let step3AbortController = null;
 
-    // 單站失敗計數與輪詢暫停控制
     let singleStopFailCount = 0;
     let isAutoPollingPaused = false;
 
@@ -211,50 +210,118 @@
 
       goToStep(3);
 
-      // 1. 九巴/龍運
       fetchKmbRoutes(searchedRouteInput, signal, container);
-      // 2. 城巴 (嚴格大寫 CTB)
       fetchCtbRoutes(searchedRouteInput, signal, container);
-      // 3. 專線小巴
       fetchGmbRoutes(searchedRouteInput, signal, container);
 
       hideLoading();
     }
 
     async function fetchKmbRoutes(route, signal, container) {
-      try {
-        const res = await apiFetch(`${API_KMB}/route/`, signal);
-        const matches = (res.data || []).filter(r => r.route === route);
-        matches.forEach(r => {
-          renderSuccessButton(container, {
-            company: 'KMB', companyName: '九巴/龍運', tagClass: 'op-kmb', route: r.route,
-            bound: r.bound === 'O' ? 'outbound' : 'inbound', serviceType: r.service_type,
-            orig: r.orig_tc, dest: r.dest_tc,
-            descText: r.service_type === '1' ? '常規班次' : `特別班次 ${r.service_type}`
-          });
+      const btn = createPlaceholderBtn(container, '九巴/龍運', 'op-kmb');
+      let attempt = 0;
+
+      const execute = async () => {
+        while (attempt < 3) {
+          try {
+            const res = await apiFetch(`${API_KMB}/route/`, signal);
+            const matches = (res.data || []).filter(r => r.route === route);
+            btn.remove();
+            if (matches.length === 0) return; // 無路線直接隱藏
+
+            matches.forEach(r => {
+              renderSuccessButton(container, {
+                company: 'KMB', companyCode: 'KMB', companyName: '九巴/龍運', tagClass: 'op-kmb', route: r.route,
+                bound: r.bound === 'O' ? 'outbound' : 'inbound', serviceType: r.service_type,
+                orig: r.orig_tc, dest: r.dest_tc,
+                descText: r.service_type === '1' ? '常規班次' : `特別班次 ${r.service_type}`
+              });
+            });
+            return;
+          } catch(e) {
+            if (e.name === 'AbortError') return;
+            attempt++;
+            if (attempt < 3) {
+              updatePlaceholderText(btn, '九巴/龍運', 'op-kmb', `資料讀取中 (重試 ${attempt}/3)...`);
+              await new Promise(r => setTimeout(r, 3000));
+            }
+          }
+        }
+
+        // 3次失敗變紅
+        setFailedBtn(btn, '九巴/龍運', 'op-kmb', async () => {
+          setLoadingBtn(btn, '九巴/龍運', 'op-kmb', '手動重試中 (0/3)...');
+          attempt = 0;
+          await execute();
         });
-      } catch(e) {
-        if(e.name !== 'AbortError') renderPlaceholderWithRetry(container, 'KMB', '九巴/龍運', 'op-kmb', route, () => fetchKmbRoutes(route, signal, container));
-      }
+      };
+
+      execute();
     }
 
     async function fetchCtbRoutes(route, signal, container) {
-      try {
-        const res = await apiFetch(`${API_CTB}/route/CTB/${route}`, signal);
-        if (res.data) {
-          const r = res.data;
-          renderSuccessButton(container, {
-            company: 'CTB', companyName: '城巴', tagClass: 'op-ctb', route: r.route, bound: 'outbound',
-            orig: r.orig_tc, dest: r.dest_tc, descText: '往目的地'
-          });
-          renderSuccessButton(container, {
-            company: 'CTB', companyName: '城巴', tagClass: 'op-ctb', route: r.route, bound: 'inbound',
-            orig: r.dest_tc, dest: r.orig_tc, descText: '往起點'
-          });
+      const btn = createPlaceholderBtn(container, '城巴', 'op-ctb');
+      let attempt = 0;
+
+      const tryFetch = async () => {
+        try {
+          const res = await apiFetch(`${API_CTB}/route/CTB/${route}`, signal);
+          if (res.data) return { data: res.data, code: 'CTB' };
+        } catch(e) {
+          if (e.name === 'AbortError') throw e;
+          // CTB 回應 422 則自動備援切換 NWFB
+          try {
+            const res2 = await apiFetch(`${API_CTB}/route/NWFB/${route}`, signal);
+            if (res2.data) return { data: res2.data, code: 'NWFB' };
+          } catch(e2) {
+            if (e2.name === 'AbortError') throw e2;
+            if (e.message.includes('422') && e2.message.includes('422')) {
+              throw new Error('NO_ROUTE'); // 雙方皆 422 代表確定無此路線
+            }
+          }
         }
-      } catch(e) {
-        if(e.name !== 'AbortError') renderPlaceholderWithRetry(container, 'CTB', '城巴', 'op-ctb', route, () => fetchCtbRoutes(route, signal, container));
-      }
+        throw new Error('FETCH_FAILED');
+      };
+
+      const execute = async () => {
+        while (attempt < 3) {
+          try {
+            const result = await tryFetch();
+            btn.remove();
+            const r = result.data;
+            renderSuccessButton(container, {
+              company: 'CTB', companyCode: result.code,
+              companyName: result.code === 'NWFB' ? '新巴/城巴' : '城巴', tagClass: 'op-ctb',
+              route: r.route, bound: 'outbound', orig: r.orig_tc, dest: r.dest_tc, descText: '往目的地'
+            });
+            renderSuccessButton(container, {
+              company: 'CTB', companyCode: result.code,
+              companyName: result.code === 'NWFB' ? '新巴/城巴' : '城巴', tagClass: 'op-ctb',
+              route: r.route, bound: 'inbound', orig: r.dest_tc, dest: r.orig_tc, descText: '往起點'
+            });
+            return;
+          } catch(err) {
+            if (err.name === 'AbortError') return;
+            if (err.message === 'NO_ROUTE') {
+              btn.remove(); // 確定無此路線直接隱藏
+              return;
+            }
+            attempt++;
+            if (attempt < 3) {
+              updatePlaceholderText(btn, '城巴', 'op-ctb', `資料讀取中 (重試 ${attempt}/3)...`);
+              await new Promise(r => setTimeout(r, 3000));
+            }
+          }
+        }
+
+        setFailedBtn(btn, '城巴', 'op-ctb', async () => {
+          setLoadingBtn(btn, '城巴', 'op-ctb', '手動重試中 (0/3)...');
+          attempt = 0;
+          await execute();
+        });
+      };
+
+      execute();
     }
 
     async function fetchGmbRoutes(route, signal, container) {
@@ -264,27 +331,76 @@
         { code: 'NT',  name: '新界小巴' }
       ];
 
-      gmbRegions.forEach(async (reg) => {
-        try {
-          const res = await apiFetch(`${API_GMB}/route/${reg.code}/${route}`, signal);
-          for(let rObj of (res.data || [])) {
-            const detailRes = await apiFetch(`${API_GMB}/route/${rObj.route_id}`, signal);
-            (detailRes.data || []).forEach(rt => {
-              (rt.directions || []).forEach(dir => {
-                const isCircular = dir.is_circular;
-                renderSuccessButton(container, {
-                  company: 'GMB', companyName: reg.name, tagClass: 'op-gmb', route: route,
-                  routeId: rObj.route_id, routeSeq: rt.route_seq || 1, 
-                  orig: dir.orig_tc, dest: dir.dest_tc,
-                  descText: isCircular ? `循環線 (經 ${dir.dest_tc})` : `常規/特別班次`
+      gmbRegions.forEach((reg) => {
+        const btn = createPlaceholderBtn(container, reg.name, 'op-gmb');
+        let attempt = 0;
+
+        const execute = async () => {
+          while (attempt < 3) {
+            try {
+              const res = await apiFetch(`${API_GMB}/route/${reg.code}/${route}`, signal);
+              const items = res.data || [];
+              btn.remove();
+
+              if (items.length === 0) return;
+
+              for(let rObj of items) {
+                const detailRes = await apiFetch(`${API_GMB}/route/${rObj.route_id}`, signal);
+                (detailRes.data || []).forEach(rt => {
+                  (rt.directions || []).forEach(dir => {
+                    renderSuccessButton(container, {
+                      company: 'GMB', companyCode: 'GMB', companyName: reg.name, tagClass: 'op-gmb', route: route,
+                      routeId: rObj.route_id, routeSeq: rt.route_seq || 1,
+                      orig: dir.orig_tc, dest: dir.dest_tc,
+                      descText: dir.is_circular ? `循環線 (經 ${dir.dest_tc})` : `常規/特別班次`
+                    });
+                  });
                 });
-              });
-            });
+              }
+              return;
+            } catch(e) {
+              if (e.name === 'AbortError') return;
+              attempt++;
+              if (attempt < 3) {
+                updatePlaceholderText(btn, reg.name, 'op-gmb', `資料讀取中 (重試 ${attempt}/3)...`);
+                await new Promise(r => setTimeout(r, 3000));
+              }
+            }
           }
-        } catch(e) {
-          if(e.name !== 'AbortError') renderPlaceholderWithRetry(container, 'GMB', reg.name, 'op-gmb', route, () => fetchGmbRoutes(route, signal, container));
-        }
+
+          setFailedBtn(btn, reg.name, 'op-gmb', async () => {
+            setLoadingBtn(btn, reg.name, 'op-gmb', '手動重試中 (0/3)...');
+            attempt = 0;
+            await execute();
+          });
+        };
+
+        execute();
       });
+    }
+
+    function createPlaceholderBtn(container, name, tagClass) {
+      const btn = document.createElement('button');
+      btn.className = 'btn-option state-loading';
+      btn.innerHTML = `<div style="display:flex; align-items:center; gap:8px;"><span class="op-tag ${tagClass}">${name}</span><span>資料讀取中 (重試 0/3)...</span></div>`;
+      container.appendChild(btn);
+      return btn;
+    }
+
+    function updatePlaceholderText(btn, name, tagClass, text) {
+      btn.innerHTML = `<div style="display:flex; align-items:center; gap:8px;"><span class="op-tag ${tagClass}">${name}</span><span>${text}</span></div>`;
+    }
+
+    function setLoadingBtn(btn, name, tagClass, text) {
+      btn.className = 'btn-option state-loading';
+      btn.onclick = null;
+      updatePlaceholderText(btn, name, tagClass, text);
+    }
+
+    function setFailedBtn(btn, name, tagClass, retryCallback) {
+      btn.className = 'btn-option state-failed';
+      updatePlaceholderText(btn, name, tagClass, '載入失敗，點擊手動重試');
+      btn.onclick = retryCallback;
     }
 
     function renderSuccessButton(container, item) {
@@ -301,49 +417,6 @@
       container.appendChild(btn);
     }
 
-    function renderPlaceholderWithRetry(container, company, companyName, tagClass, route, retryFn) {
-      const btn = document.createElement('button');
-      btn.className = 'btn-option state-loading';
-      let attempt = 0;
-
-      const updateUI = (text) => {
-        btn.innerHTML = `
-          <div style="display:flex; align-items:center; gap:8px;">
-            <span class="op-tag ${tagClass}">${companyName}</span>
-            <span>${text}</span>
-          </div>
-        `;
-      };
-
-      updateUI(`資料讀取中 (重試 ${attempt}/3)...`);
-      container.appendChild(btn);
-
-      const runAutoRetry = async () => {
-        while (attempt < 3) {
-          await new Promise(r => setTimeout(r, 3000));
-          attempt++;
-          updateUI(`資料讀取中 (重試 ${attempt}/3)...`);
-          try {
-            await retryFn();
-            btn.remove();
-            return;
-          } catch(e) {}
-        }
-
-        // 3次全敗，變紅
-        btn.className = 'btn-option state-failed';
-        updateUI(`載入失敗，點擊手動重試`);
-        btn.onclick = async () => {
-          btn.className = 'btn-option state-loading';
-          attempt = 0;
-          updateUI(`手動重試中 (0/3)...`);
-          await runAutoRetry();
-        };
-      };
-
-      runAutoRetry();
-    }
-
     async function selectRouteDirection(item) {
       selectedRouteItem = item;
       showLoading(`正在載入車站列表...`);
@@ -358,16 +431,30 @@
           routeStops = (rawData.data || []).map((s, idx) => ({ seq: parseInt(s.seq), stopId: s.stop, name: stopDetails[idx].data ? stopDetails[idx].data.name_tc : "車站" }));
 
         } else if (item.company === 'CTB') {
-          const rawData = await apiFetch(`${API_CTB}/route-stop/CTB/${item.route}/${item.bound}`);
+          const rawData = await apiFetch(`${API_CTB}/route-stop/${item.companyCode}/${item.route}/${item.bound}`);
           const stopPromises = (rawData.data || []).map(s => apiFetch(`${API_CTB}/stop/${s.stop}`));
           const stopDetails = await Promise.all(stopPromises);
           routeStops = (rawData.data || []).map((s, idx) => ({ seq: parseInt(s.seq), stopId: s.stop, name: stopDetails[idx].data ? stopDetails[idx].data.name_tc : "車站" }));
 
         } else if (item.company === 'GMB') {
           const rawData = await apiFetch(`${API_GMB}/route-stop/${item.routeId}/${item.routeSeq}`);
-          const stopPromises = (rawData.data || []).map(s => apiFetch(`${API_GMB}/stop/${s.stop_id}`));
+          const stopPromises = (rawData.data || []).map(s => {
+            if (!s.stop_id) return Promise.resolve(null);
+            return apiFetch(`${API_GMB}/stop/${s.stop_id}`).catch(() => null);
+          });
           const stopDetails = await Promise.all(stopPromises);
-          routeStops = (rawData.data || []).map((s, idx) => ({ seq: parseInt(s.stop_seq), stopId: s.stop_id, name: stopDetails[idx].data ? stopDetails[idx].data.name_tc : "車站" }));
+
+          routeStops = (rawData.data || []).map((s, idx) => {
+            const seqNum = parseInt(s.stop_seq || idx + 1);
+            const stopName = (stopDetails[idx] && stopDetails[idx].data && stopDetails[idx].data.name_tc) 
+              ? stopDetails[idx].data.name_tc 
+              : `[第 ${seqNum} 站 - 站名缺失]`;
+            return {
+              seq: seqNum,
+              stopId: s.stop_id || null,
+              name: stopName
+            };
+          });
         }
 
         renderTimeline();
@@ -434,6 +521,10 @@
     }
 
     async function fetchSingleStopETA(stopObj) {
+      if (!stopObj.stopId) {
+        return { missingStopId: true };
+      }
+
       const item = selectedRouteItem;
       if (item.company === 'KMB') {
         const res = await apiFetch(`${API_KMB}/eta/${stopObj.stopId}/${item.route}/${item.serviceType}`);
@@ -441,7 +532,7 @@
         return (res.data || []).filter(e => e.dir === dir && e.eta).map(e => e.eta);
 
       } else if (item.company === 'CTB') {
-        const res = await apiFetch(`${API_CTB}/eta/CTB/${stopObj.stopId}/${item.route}`);
+        const res = await apiFetch(`${API_CTB}/eta/${item.companyCode}/${stopObj.stopId}/${item.route}`);
         const dir = item.bound === 'outbound' ? 'O' : 'I';
         return (res.data || []).filter(e => e.dir === dir && e.eta).map(e => e.eta);
 
@@ -480,7 +571,6 @@
         detailContainer.innerHTML = htmlContent + adjHtml;
         document.getElementById('update-timer').innerText = `最後更新時間：${new Date().toLocaleTimeString()}`;
 
-        // 成功取得資料，重置失敗計數
         singleStopFailCount = 0;
 
       } catch(e) {
@@ -489,7 +579,7 @@
         }
 
         if (singleStopFailCount >= 3) {
-          isAutoPollingPaused = true; // 暫停自動輪詢
+          isAutoPollingPaused = true;
           detailContainer.innerHTML = `
             <div style="font-size:0.85rem; color:#E53E3E; padding:8px 0; display:flex; justify-content:space-between; align-items:center;">
               <span>連續 3 次獲取失敗，自動更新已暫停</span>
@@ -515,7 +605,9 @@
           <div class="eta-list-row">
       `;
 
-      if (!etas || etas.length === 0) {
+      if (etas && etas.missingStopId) {
+        block += `<div style="font-size:0.85rem; color:#C53030; padding:4px;">站點代碼缺失，無法預測到站</div>`;
+      } else if (!etas || etas.length === 0) {
         block += `<div style="font-size:0.85rem; color:#888; padding:4px;">暫無實時數據</div>`;
       } else {
         etas.slice(0, 3).forEach(etaStr => {
